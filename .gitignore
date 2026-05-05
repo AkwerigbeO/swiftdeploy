@@ -1,0 +1,33 @@
+# Generated config files
+docker-compose.yml
+nginx.conf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+screenshots/
+
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Environment variables
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db

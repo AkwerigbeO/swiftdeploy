@@ -1,0 +1,16 @@
+services:
+  image: swift-odysia:latest
+  port: 3000
+  mode: canary
+  version: v1
+  restart_policy: unless-stopped
+
+nginx:
+  image: nginx:latest
+  port: 8844
+  proxy_timeout: 10s
+  contact: akwerigbeoke@gmail.com
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
