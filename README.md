@@ -1,70 +1,108 @@
 # SwiftDeploy
 
-SwiftDeploy is a lightweight, declarative deployment tool designed to simplify managing and scaling containerized web applications. By using a single `manifest.yaml` as the source of truth, the CLI dynamically generates `docker-compose.yml` and `nginx.conf` configurations from templates, providing a robust wrapper around the deployment lifecycle.
+SwiftDeploy is a declarative deployment CLI for running a containerized API behind Nginx with observability, policy enforcement, chaos testing, and audit reporting.
 
-It features built-in support for multiple deployment modes (e.g., stable and canary), integrated health checks, and chaos engineering testing capabilities to validate your system's resilience.
+Instead of editing generated infrastructure files by hand, you describe the stack in `manifest.yaml`. The `swiftdeploy` CLI reads that manifest, generates `docker-compose.yml` and `nginx.conf` from templates, starts the stack, checks policy decisions with Open Policy Agent (OPA), and records operational history.
 
-## Features
+## What This Project Demonstrates
 
-- **Declarative Configuration:** Define your service, network, and reverse proxy settings in a single `manifest.yaml`.
-- **Automated Generation:** Automatically generates Docker Compose and Nginx configuration files based on the manifest.
-- **Pre-flight Validation:** Checks for valid YAML, required fields, local image availability, port conflicts, and syntactical validity of Nginx configurations before deployment.
-- **Zero-Downtime Promotions:** Switch between "stable" and "canary" modes easily with automated container recreation and health checks.
-- **Chaos Engineering:** In canary mode, perform chaos testing (e.g., simulated latency and error injection) via simple API calls to test system resilience.
-- **Prometheus Metrics:** Exposes `/metrics` with request counters, latency histogram, uptime, mode, and chaos state.
-- **OPA Policy Gates:** `deploy` and `promote` ask Open Policy Agent for allow/deny decisions before changing the stack.
-- **Status Dashboard:** `swiftdeploy status` scrapes metrics, calculates req/s and P99 latency, evaluates policy compliance, and writes `history.jsonl`.
-- **Audit Report:** `swiftdeploy audit` generates `audit_report.md` from the history trail.
-- **Clean Lifecycle Management:** Simple commands to initialize, deploy, promote, and tear down the stack.
+- Declarative deployment from a single `manifest.yaml`
+- Programmatic generation of Docker Compose and Nginx config
+- Stable/canary deployment mode controlled by environment variables
+- Prometheus-style `/metrics` endpoint
+- OPA policy gates before deploy and promote operations
+- Canary safety checks using error rate and P99 latency
+- Live terminal status dashboard
+- JSONL history trail and Markdown audit report
+- Chaos testing with slow/error/recover modes
+- Nginx-only public ingress, with the app and OPA protected from direct public access
+
+## Architecture
+
+```text
+Operator
+  |
+  v
+swiftdeploy CLI
+  |-- reads manifest.yaml
+  |-- renders templates/docker-compose.yml.tpl -> docker-compose.yml
+  |-- renders templates/nginx.conf.tpl -> nginx.conf
+  |-- queries OPA for policy decisions
+  |-- scrapes /metrics for status and promotion checks
+  `-- writes history.jsonl and audit_report.md
+
+Public traffic
+  |
+  v
+Nginx :8844
+  |
+  v
+FastAPI app :3000
+
+OPA is bound to 127.0.0.1:8181 for CLI access only.
+```
 
 ## Project Structure
 
 ```text
 .
-├── app/                    # FastAPI service demonstrating the deployment
-├── templates/              # Docker Compose and Nginx templates
-├── Dockerfile              # Lightweight API image definition
-├── manifest.yaml           # Single source of truth for deployments
-├── swiftdeploy             # Python CLI entrypoint
-└── README.md               # Project documentation
+|-- app/
+|   |-- main.py
+|   `-- requirements.txt
+|-- policies/
+|   |-- canary.rego
+|   `-- infra.rego
+|-- templates/
+|   |-- docker-compose.yml.tpl
+|   `-- nginx.conf.tpl
+|-- .gitignore
+|-- Dockerfile
+|-- LICENSE
+|-- manifest.yaml
+|-- README.md
+|-- requirements.txt
+`-- swiftdeploy
 ```
+
+Generated runtime files are intentionally ignored by Git:
+
+```text
+docker-compose.yml
+nginx.conf
+history.jsonl
+audit_report.md
+```
+
+They can be regenerated from the manifest and runtime commands.
 
 ## Requirements
 
 - Docker Desktop or Docker Engine
 - Docker Compose v2
 - Python 3.10+
+- Optional: `PyYAML` for richer YAML parsing
 
-*Note: The CLI works natively with the standard library but can optionally use `PyYAML` if installed. A fallback parser is included for parsing the simple manifest format without external dependencies.*
-
-## Setup
-
-First, build the Docker image for the application referenced by `manifest.yaml`:
+Install optional CLI dependencies:
 
 ```bash
-docker build -t swift-odysia:latest .
+pip install -r requirements.txt
 ```
 
-To initialize the configurations (generates `docker-compose.yml` and `nginx.conf`):
+Install app dependencies only if you want to run the FastAPI app outside Docker:
 
 ```bash
-./swiftdeploy init
+pip install -r app/requirements.txt
 ```
 
-*For Windows PowerShell users, prefix the command with python:*
-```powershell
-python swiftdeploy init
-```
+## Manifest
 
-## Configuration Manifest
-
-The deployment is controlled entirely via `manifest.yaml`:
+`manifest.yaml` is the source of truth:
 
 ```yaml
 services:
   image: swift-odysia:latest
   port: 3000
-  mode: stable
+  mode: canary
   version: v1
   restart_policy: unless-stopped
 
@@ -87,13 +125,75 @@ policy:
   canary_window_seconds: 30
 ```
 
-*Note: Do not manually edit the generated `docker-compose.yml` or `nginx.conf`. Instead, update `manifest.yaml` and re-run `./swiftdeploy init`.*
+Do not manually edit `docker-compose.yml` or `nginx.conf`. Edit `manifest.yaml`, then run:
 
-## CLI Usage
+```bash
+./swiftdeploy init
+```
+
+On Windows PowerShell:
+
+```powershell
+python swiftdeploy init
+```
+
+## Quick Start
+
+Clone the repository:
+
+```bash
+git clone https://github.com/AkwerigbeO/swiftdeploy.git
+cd swiftdeploy
+```
+
+Build the app image referenced in `manifest.yaml`:
+
+```bash
+docker build -t swift-odysia:latest .
+```
+
+Generate the infrastructure files:
+
+```bash
+./swiftdeploy init
+```
+
+Validate the project:
+
+```bash
+./swiftdeploy validate
+```
+
+Deploy the stack:
+
+```bash
+./swiftdeploy deploy
+```
+
+Check the app through Nginx:
+
+```bash
+curl http://localhost:8844/healthz
+```
+
+Expected shape:
+
+```json
+{
+  "status": "ok",
+  "uptime": 12,
+  "mode": "canary"
+}
+```
+
+## CLI Commands
 
 ### `init`
 
-Parses `manifest.yaml` and regenerates the Docker Compose and Nginx configuration files.
+Reads `manifest.yaml` and generates:
+
+- `docker-compose.yml`
+- `nginx.conf`
 
 ```bash
 ./swiftdeploy init
@@ -101,20 +201,36 @@ Parses `manifest.yaml` and regenerates the Docker Compose and Nginx configuratio
 
 ### `validate`
 
-Runs comprehensive pre-flight checks and exits with a non-zero status code on failure. It validates:
-- `manifest.yaml` exists and is formatted correctly.
-- All required manifest fields are present.
-- The targeted Docker image exists locally.
-- The specified Nginx host port is available.
-- The generated `nginx.conf` passes the `nginx -t` test.
+Runs five pre-flight checks:
+
+- `manifest.yaml` exists and parses as YAML
+- required fields are present and non-empty
+- the Docker image referenced by the manifest exists locally
+- the Nginx host port is not already bound
+- generated `nginx.conf` passes `nginx -t`
 
 ```bash
 ./swiftdeploy validate
 ```
 
+If the stack is already running, the port check can fail because Nginx is already bound to the manifest port. Stop the stack first:
+
+```bash
+./swiftdeploy teardown
+./swiftdeploy validate
+```
+
 ### `deploy`
 
-Initializes configurations, starts OPA, sends host disk/CPU facts to OPA, blocks on policy violations, starts the Docker stack, and waits up to 60 seconds for a successful `/healthz` check through the Nginx reverse proxy.
+Runs a gated deployment:
+
+1. Generates config files
+2. Starts the OPA sidecar
+3. Waits for OPA readiness
+4. Sends host disk and CPU data to OPA
+5. Blocks if infrastructure policy denies the deploy
+6. Starts the full Docker Compose stack
+7. Waits up to 60 seconds for `/healthz`
 
 ```bash
 ./swiftdeploy deploy
@@ -122,7 +238,9 @@ Initializes configurations, starts OPA, sends host disk/CPU facts to OPA, blocks
 
 ### `promote`
 
-Scrapes `/metrics`, sends canary error-rate/P99 data to OPA, blocks unhealthy promotions, updates the service mode in the manifest, regenerates configurations, recreates the app container, and confirms the new mode via `/healthz`.
+Switches the service mode between `stable` and `canary`.
+
+Before promotion, the CLI samples `/metrics` over the configured policy window, calculates error rate and P99 latency, and sends those facts to OPA. If the canary policy denies the request, promotion is blocked.
 
 ```bash
 ./swiftdeploy promote canary
@@ -131,40 +249,65 @@ Scrapes `/metrics`, sends canary error-rate/P99 data to OPA, blocks unhealthy pr
 
 ### `status`
 
-Shows a live terminal dashboard of metrics and policy compliance. Each scrape is appended to `history.jsonl`.
+Displays a live terminal dashboard and appends every scrape to `history.jsonl`.
 
 ```bash
 ./swiftdeploy status
+```
+
+One-shot mode for screenshots or quick checks:
+
+```bash
 ./swiftdeploy status --count 1
 ```
 
+Custom refresh interval:
+
+```bash
+./swiftdeploy status --interval 5
+```
+
+The dashboard shows:
+
+- current mode
+- uptime
+- chaos state
+- request throughput
+- error rate
+- P99 latency
+- policy compliance from OPA
+
 ### `audit`
 
-Parses `history.jsonl` and generates `audit_report.md`.
+Generates `audit_report.md` from `history.jsonl`.
 
 ```bash
 ./swiftdeploy audit
 ```
 
+The report includes:
+
+- action breakdown
+- timeline
+- policy failures and violations
+
 ### `teardown`
 
-Removes all running containers, networks, and volumes associated with the stack.
+Removes containers, networks, and volumes:
 
 ```bash
 ./swiftdeploy teardown
 ```
 
-To also delete the dynamically generated configuration files:
+Also delete generated configs:
 
 ```bash
 ./swiftdeploy teardown --clean
 ```
 
-## API & Chaos Testing
+## API Endpoints
 
-All traffic is routed through the Nginx reverse proxy on the port specified in your manifest (default `8080`).
-
-### Standard Endpoints
+All app traffic goes through Nginx on port `8844`.
 
 ```bash
 curl http://localhost:8844/
@@ -172,57 +315,379 @@ curl http://localhost:8844/healthz
 curl http://localhost:8844/metrics
 ```
 
-## Policy Enforcement
+### `GET /`
 
-OPA is generated into `docker-compose.yml` as a sidecar service. It loads all `.rego` files from `policies/` and is bound to `127.0.0.1:8181`, so the CLI can query it from the host while the public Nginx ingress cannot expose the OPA API.
+Returns a welcome payload with mode, version, and timestamp.
 
-Current policies:
+### `GET /healthz`
 
-- `policies/infra.rego`: denies deploy if disk free is below `policy.infra_min_disk_gb` or CPU load is above `policy.infra_max_cpu_load`.
-- `policies/canary.rego`: denies promotion if error rate is above `policy.canary_max_error_rate` or P99 latency is above `policy.canary_max_p99_latency_seconds`.
+Returns liveness information:
 
-The Rego files do not hardcode thresholds. Limits come from `manifest.yaml` and are sent as OPA input.
+```json
+{
+  "status": "ok",
+  "uptime": 10,
+  "mode": "canary"
+}
+```
 
-### Canary Mode & Chaos Injection
+### `GET /metrics`
 
-When the application is running in `canary` mode, it appends an `X-Mode: canary` header to responses and enables the chaos engineering endpoints.
+Returns Prometheus text format metrics:
 
-Inject artificial latency (e.g., 2 seconds):
+- `http_requests_total{method,path,status_code}`
+- `http_request_duration_seconds`
+- `app_uptime_seconds`
+- `app_mode`
+- `chaos_active`
+
+### `POST /chaos`
+
+Available only in canary mode.
+
+Slow responses:
+
 ```bash
 curl -X POST http://localhost:8844/chaos \
   -H "Content-Type: application/json" \
   -d '{"mode":"slow","duration":2}'
 ```
 
-Inject a simulated error rate (e.g., 50% of requests fail):
+Simulated errors:
+
 ```bash
 curl -X POST http://localhost:8844/chaos \
   -H "Content-Type: application/json" \
   -d '{"mode":"error","rate":0.5}'
 ```
 
-Recover normal behavior:
+Recover:
+
 ```bash
 curl -X POST http://localhost:8844/chaos \
   -H "Content-Type: application/json" \
   -d '{"mode":"recover"}'
 ```
 
+## Observability
+
+SwiftDeploy uses the app's `/metrics` endpoint for both visibility and policy input.
+
+The CLI parses Prometheus metrics to calculate:
+
+- total requests
+- 5xx error rate
+- estimated P99 latency from histogram buckets
+- app mode
+- uptime
+- chaos state
+
+Run:
+
+```bash
+./swiftdeploy status --count 1
+```
+
+Example output:
+
+```text
+========================================================================
+SWIFTDEPLOY STATUS
+========================================================================
+Time          : 2026-05-06T17:39:30.794723+00:00
+Mode          : canary
+Uptime        : 10s
+Chaos         : 0 (0=none, 1=slow, 2=error)
+Throughput    : 0.00 req/s
+Error rate    : 0.00%
+P99 latency   : 0.100s
+
+Policy Compliance
+- infra: PASS - policy allowed
+- canary: PASS - policy allowed
+========================================================================
+```
+
+## Policy Enforcement
+
+OPA is included as a sidecar container in the generated Compose file.
+
+```yaml
+opa:
+  image: openpolicyagent/opa:latest
+  command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+  volumes:
+    - ./policies:/policies
+  ports:
+    - "127.0.0.1:8181:8181"
+```
+
+OPA loads all `.rego` files from `policies/`.
+
+The CLI does not make allow/deny decisions itself. It sends context to OPA, then acts on OPA's response.
+
+### Infrastructure Policy
+
+File:
+
+```text
+policies/infra.rego
+```
+
+Blocks deployment if:
+
+- disk free is below `policy.infra_min_disk_gb`
+- CPU load is above `policy.infra_max_cpu_load`
+
+Default manifest values:
+
+```yaml
+infra_min_disk_gb: 10
+infra_max_cpu_load: 2.0
+```
+
+### Canary Policy
+
+File:
+
+```text
+policies/canary.rego
+```
+
+Blocks promotion if:
+
+- error rate is above `policy.canary_max_error_rate`
+- P99 latency is above `policy.canary_max_p99_latency_seconds`
+
+Default manifest values:
+
+```yaml
+canary_max_error_rate: 0.01
+canary_max_p99_latency_seconds: 0.5
+canary_window_seconds: 30
+```
+
+## OPA Isolation
+
+OPA must be reachable by the CLI but not exposed through public Nginx ingress.
+
+This project binds OPA to localhost:
+
+```text
+127.0.0.1:8181
+```
+
+Test that OPA is available locally:
+
+```bash
+curl http://127.0.0.1:8181/v1/data/infra
+```
+
+Test that OPA is not exposed through Nginx:
+
+```bash
+curl http://localhost:8844/v1/data/infra
+```
+
+The Nginx request should not return OPA policy data.
+
 ## Nginx Behavior
 
-The dynamically generated Nginx configuration ensures:
-- Traffic is proxied correctly to the upstream application.
-- A custom timeout (`proxy_timeout`) is enforced.
-- Responses include a custom `X-Deployed-By: swiftdeploy` header.
-- Upstream custom headers (like `X-Mode`) are forwarded to the client.
-- JSON-formatted bodies are returned for `502`, `503`, and `504` HTTP errors.
-- Comprehensive access logs are written in the following format:
+The generated Nginx config:
+
+- listens on the manifest Nginx port
+- proxies traffic to the app service
+- uses `nginx.proxy_timeout`
+- adds `X-Deployed-By: swiftdeploy`
+- forwards upstream `X-Mode`
+- returns JSON error bodies for `502`, `503`, and `504`
+- writes access logs in the required format
+
+Access log format:
 
 ```nginx
 $time_iso8601 | $status | ${request_time}s | $upstream_addr | $request
 ```
 
-To view the real-time access logs:
+View logs:
+
 ```bash
-docker compose logs -f nginx
+docker compose logs --tail=20 nginx
 ```
+
+## Docker Security Choices
+
+The generated Compose config applies basic container hardening:
+
+- app and Nginx run as non-root users
+- Linux capabilities are dropped
+- `no-new-privileges:true` is enabled
+- the app port is not published directly
+- all public traffic flows through Nginx
+- logs use a named volume
+
+## Reproducing a Canary Failure
+
+Deploy the app:
+
+```bash
+./swiftdeploy deploy
+```
+
+Ensure canary mode:
+
+```bash
+./swiftdeploy promote canary
+```
+
+Inject slow behavior:
+
+```bash
+curl -X POST http://localhost:8844/chaos \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"slow","duration":2}'
+```
+
+Generate traffic:
+
+```bash
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -s http://localhost:8844/ > /dev/null; done
+```
+
+Check status:
+
+```bash
+./swiftdeploy status --count 1
+```
+
+Inject errors:
+
+```bash
+curl -X POST http://localhost:8844/chaos \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"error","rate":0.5}'
+```
+
+Generate traffic:
+
+```bash
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do curl -s http://localhost:8844/ > /dev/null; done
+```
+
+Try a promotion:
+
+```bash
+./swiftdeploy promote stable
+```
+
+If the error rate or P99 latency exceeds the configured threshold, OPA blocks the promotion.
+
+Recover:
+
+```bash
+curl -X POST http://localhost:8844/chaos \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"recover"}'
+```
+
+## PowerShell Examples
+
+If you are on Windows, use these equivalents.
+
+Health:
+
+```powershell
+Invoke-RestMethod http://localhost:8844/healthz
+```
+
+Metrics:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://localhost:8844/metrics |
+  Select-Object -ExpandProperty Content
+```
+
+Generate traffic:
+
+```powershell
+1..20 | ForEach-Object {
+  try {
+    Invoke-WebRequest -UseBasicParsing http://localhost:8844/ | Out-Null
+  } catch {}
+}
+```
+
+Inject chaos:
+
+```powershell
+Invoke-RestMethod http://localhost:8844/chaos `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body '{"mode":"error","rate":0.5}'
+```
+
+## Troubleshooting
+
+### `validate` fails because the Nginx port is in use
+
+The stack may already be running.
+
+```bash
+./swiftdeploy teardown
+./swiftdeploy validate
+```
+
+### Docker image does not exist locally
+
+Build it:
+
+```bash
+docker build -t swift-odysia:latest .
+```
+
+### OPA is unavailable
+
+Start or redeploy the stack:
+
+```bash
+./swiftdeploy deploy
+```
+
+Check OPA:
+
+```bash
+curl http://127.0.0.1:8181/health?plugins
+```
+
+### Generated files look stale
+
+Regenerate them:
+
+```bash
+./swiftdeploy init
+```
+
+### Need a clean reset
+
+```bash
+./swiftdeploy teardown --clean
+./swiftdeploy init
+```
+
+## Submission Notes
+
+Useful outputs to capture:
+
+- `swiftdeploy validate`
+- `swiftdeploy deploy`
+- `swiftdeploy status --count 1`
+- `/metrics` output
+- blocked promotion after chaos injection
+- generated `docker-compose.yml`
+- generated `nginx.conf`
+- Nginx access logs
+- `audit_report.md`
+
+## License
+
+This project is licensed under the terms in [LICENSE](LICENSE).
