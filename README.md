@@ -674,19 +674,23 @@ Regenerate them:
 ./swiftdeploy init
 ```
 
-## Submission Notes
+## Demo Checklist
 
-Useful outputs to capture:
+Use this sequence to demonstrate the main capabilities:
 
-- `swiftdeploy validate`
-- `swiftdeploy deploy`
-- `swiftdeploy status --count 1`
-- `/metrics` output
-- blocked promotion after chaos injection
-- generated `docker-compose.yml`
-- generated `nginx.conf`
-- Nginx access logs
-- `audit_report.md`
+```bash
+docker build -t swift-odysia:latest .
+./swiftdeploy init
+./swiftdeploy validate
+./swiftdeploy deploy
+curl http://localhost:8844/healthz
+curl http://localhost:8844/metrics
+./swiftdeploy status --count 1
+./swiftdeploy audit
+docker compose logs --tail=20 nginx
+```
+
+For a policy demo, enable canary mode, inject chaos, generate traffic, then run `status` and `promote` to show how OPA protects the deployment flow.
 
 ## License
 
