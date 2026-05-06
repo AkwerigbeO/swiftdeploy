@@ -2,12 +2,15 @@
 import argparse
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Try to import PyYAML for robust manifest parsing
@@ -24,6 +27,8 @@ MANIFEST = ROOT / "manifest.yaml"
 COMPOSE_FILE = ROOT / "docker-compose.yml"
 NGINX_CONF = ROOT / "nginx.conf"
 TEMPLATE_DIR = ROOT / "templates"
+HISTORY_FILE = ROOT / "history.jsonl"
+AUDIT_REPORT = ROOT / "audit_report.md"
 
 
 # --- Validation Rules ---
@@ -33,6 +38,29 @@ REQUIRED_FIELDS = {
     "network": ["name", "driver_type"],
 }
 
+
+# --- History / Audit Logging ---
+
+def log_event(action, detail=None, success=True):
+    """Appends a structured JSON event to history.jsonl for auditing."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "success": success,
+    }
+    if detail:
+        entry["detail"] = detail
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def append_history(entry):
+    entry.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+# --- Shell Helpers ---
 
 def run(cmd, *, check=True, capture=False):
     """Utility function to run shell commands in the project root."""
@@ -44,6 +72,8 @@ def run(cmd, *, check=True, capture=False):
         capture_output=capture,
     )
 
+
+# --- Manifest I/O ---
 
 def load_manifest():
     """Reads manifest.yaml and converts it into a Python dictionary."""
@@ -137,6 +167,240 @@ def render_template(name, values):
     return template
 
 
+# --- Policy & Metrics ---
+
+def query_opa(policy, payload):
+    """Sends a query to the OPA server and returns a structured result."""
+    manifest = load_manifest()
+    opa_url = manifest.get("policy", {}).get("opa_url", "http://127.0.0.1:8181").rstrip("/")
+    url = f"{opa_url}/v1/data/{policy}"
+    data = json.dumps({"input": payload}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            result = res.get("result")
+            if not isinstance(result, dict):
+                return {
+                    "allow": False,
+                    "reasons": [f"OPA returned an invalid decision for {policy}: expected object, got {type(result).__name__}"],
+                    "failure": "invalid_response",
+                }
+            result.setdefault("reasons", [])
+            return result
+    except urllib.error.HTTPError as e:
+        return {"allow": False, "reasons": [f"OPA HTTP error while querying {policy}: {e.code} {e.reason}"], "failure": "http_error"}
+    except urllib.error.URLError as e:
+        return {"allow": False, "reasons": [f"OPA unavailable while querying {policy}: {e.reason}"], "failure": "unavailable"}
+    except TimeoutError:
+        return {"allow": False, "reasons": [f"OPA timed out while querying {policy}"], "failure": "timeout"}
+    except json.JSONDecodeError:
+        return {"allow": False, "reasons": [f"OPA returned non-JSON response for {policy}"], "failure": "bad_json"}
+
+
+def check_predeploy():
+    """Checks infrastructure policy (disk, CPU) before allowing a deploy."""
+    print("Running pre-deploy policy checks...")
+    try:
+        manifest = load_manifest()
+        policy = manifest.get("policy", {})
+        usage = shutil.disk_usage(ROOT)
+        disk_free = round(usage.free / (1024 ** 3), 2)
+        cpu_load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
+
+        payload = {
+            "disk_free": disk_free,
+            "min_disk": float(policy.get("infra_min_disk_gb", 10)),
+            "cpu_load": cpu_load,
+            "max_cpu": float(policy.get("infra_max_cpu_load", 2.0)),
+            "question": "pre-deploy",
+        }
+
+        result = query_opa("infra", payload)
+        if not result.get("allow", True):
+            print("DEPLOY BLOCKED by infra policy:")
+            for reason in result.get("reasons", []):
+                print(f" - {reason}")
+            append_history({"action": "policy_check", "domain": "infra", "success": False, "detail": result.get("reasons", []), "input": payload})
+            return False
+
+        append_history({"action": "policy_check", "domain": "infra", "success": True, "detail": result.get("reasons", []), "input": payload})
+        print("PASS: Infra policy check passed.")
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to run pre-deploy checks: {e}")
+        return False
+
+
+def check_prepromote(manifest):
+    """Checks canary health (error rate, latency) before allowing a promotion."""
+    print("Running pre-promote policy checks...")
+    try:
+        policy = manifest.get("policy", {})
+        window_seconds = int(policy.get("canary_window_seconds", 30))
+        print(f"Sampling canary metrics for {window_seconds}s...")
+        before = scrape_metrics_snapshot(manifest)
+        time.sleep(window_seconds)
+        after = scrape_metrics_snapshot(manifest)
+
+        before_requests = before["raw"]["requests"]
+        after_requests = after["raw"]["requests"]
+        total_delta = 0.0
+        error_delta = 0.0
+        for key, after_value in after_requests.items():
+            delta = max(after_value - before_requests.get(key, 0.0), 0.0)
+            total_delta += delta
+            if key[2].startswith("5"):
+                error_delta += delta
+        error_rate = error_delta / total_delta if total_delta else 0.0
+
+        before_buckets = before["raw"]["buckets"]
+        after_buckets = after["raw"]["buckets"]
+        window_buckets = {
+            le: max(after_value - before_buckets.get(le, 0.0), 0.0)
+            for le, after_value in after_buckets.items()
+        }
+        latency_p99 = histogram_quantile(0.99, window_buckets)
+
+        payload = {
+            "error_rate": error_rate,
+            "max_error_rate": float(policy.get("canary_max_error_rate", 0.01)),
+            "p99_latency": latency_p99,
+            "max_latency": float(policy.get("canary_max_p99_latency_seconds", 0.5)),
+            "window_seconds": window_seconds,
+            "question": "pre-promote",
+        }
+
+        result = query_opa("canary", payload)
+        if not result.get("allow", True):
+            print("PROMOTION BLOCKED by canary policy:")
+            for reason in result.get("reasons", []):
+                print(f" - {reason}")
+            append_history({"action": "policy_check", "domain": "canary", "success": False, "detail": result.get("reasons", []), "input": payload})
+            return False
+
+        append_history({"action": "policy_check", "domain": "canary", "success": True, "detail": result.get("reasons", []), "input": payload})
+        print("PASS: Canary policy check passed.")
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to run pre-promote checks: {e}")
+        return False
+
+
+def parse_labels(label_text):
+    labels = {}
+    for part in re.findall(r'(\w+)="([^"]*)"', label_text):
+        labels[part[0]] = part[1]
+    return labels
+
+
+def parse_prometheus_metrics(metrics_text):
+    counters = {}
+    buckets = {}
+    mode = None
+    uptime = None
+    chaos = None
+    for raw in metrics_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pieces = line.rsplit(None, 1)
+        if len(pieces) != 2:
+            continue
+        metric, value_text = pieces
+        try:
+            value = float(value_text)
+        except ValueError:
+            continue
+        if metric.startswith("http_requests_total{"):
+            labels = parse_labels(metric)
+            key = (labels.get("method", ""), labels.get("path", ""), labels.get("status_code", ""))
+            counters[key] = value
+        elif metric.startswith("http_request_duration_seconds_bucket{"):
+            labels = parse_labels(metric)
+            le = labels.get("le")
+            if le:
+                buckets[le] = value
+        elif metric == "app_mode":
+            mode = value
+        elif metric == "app_uptime_seconds":
+            uptime = value
+        elif metric == "chaos_active":
+            chaos = value
+    return {"requests": counters, "buckets": buckets, "mode": mode, "uptime": uptime, "chaos": chaos}
+
+
+def histogram_quantile(q, buckets):
+    finite = []
+    total = 0.0
+    for le, count in buckets.items():
+        if le == "+Inf":
+            total = max(total, count)
+            continue
+        try:
+            finite.append((float(le), count))
+        except ValueError:
+            continue
+    finite.sort()
+    if total <= 0 and finite:
+        total = finite[-1][1]
+    if total <= 0:
+        return 0.0
+    target = q * total
+    for bound, cumulative in finite:
+        if cumulative >= target:
+            return bound
+    return finite[-1][0] if finite else 0.0
+
+
+def scrape_metrics_snapshot(manifest):
+    port = manifest["nginx"]["port"]
+    url = f"http://127.0.0.1:{port}/metrics"
+    with urllib.request.urlopen(url, timeout=5) as response:
+        metrics_text = response.read().decode("utf-8")
+    parsed = parse_prometheus_metrics(metrics_text)
+    total = sum(parsed["requests"].values())
+    errors = sum(value for (_method, _path, status), value in parsed["requests"].items() if status.startswith("5"))
+    error_rate = errors / total if total else 0.0
+    p99 = histogram_quantile(0.99, parsed["buckets"])
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_requests": total,
+        "error_requests": errors,
+        "error_rate": error_rate,
+        "p99_latency_seconds": p99,
+        "mode": parsed["mode"],
+        "uptime": parsed["uptime"],
+        "chaos_active": parsed["chaos"],
+        "raw": parsed,
+    }
+
+
+def evaluate_policy_compliance(manifest, snapshot):
+    policy = manifest.get("policy", {})
+    usage = shutil.disk_usage(ROOT)
+    infra_input = {
+        "disk_free": round(usage.free / (1024 ** 3), 2),
+        "min_disk": float(policy.get("infra_min_disk_gb", 10)),
+        "cpu_load": os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0,
+        "max_cpu": float(policy.get("infra_max_cpu_load", 2.0)),
+        "question": "status",
+    }
+    canary_input = {
+        "error_rate": snapshot["error_rate"],
+        "max_error_rate": float(policy.get("canary_max_error_rate", 0.01)),
+        "p99_latency": snapshot["p99_latency_seconds"],
+        "max_latency": float(policy.get("canary_max_p99_latency_seconds", 0.5)),
+        "window_seconds": int(policy.get("canary_window_seconds", 30)),
+        "question": "status",
+    }
+    return {
+        "infra": {"input": infra_input, "decision": query_opa("infra", infra_input)},
+        "canary": {"input": canary_input, "decision": query_opa("canary", canary_input)},
+    }
+
+
 # --- CLI Commands ---
 
 def command_init(_args=None):
@@ -147,8 +411,7 @@ def command_init(_args=None):
     service = manifest["services"]
     nginx = manifest["nginx"]
     network = manifest["network"]
-    
-    # Map manifest values to template placeholders
+
     values = {
         "SERVICE_IMAGE": service["image"],
         "MODE": service.get("mode", "stable"),
@@ -164,7 +427,6 @@ def command_init(_args=None):
         "RESTART_POLICY": service.get("restart_policy", "unless-stopped"),
     }
 
-    # Generate the configuration files
     COMPOSE_FILE.write_text(render_template("docker-compose.yml.tpl", values), encoding="utf-8")
     NGINX_CONF.write_text(render_template("nginx.conf.tpl", values), encoding="utf-8")
     print("PASS: generated docker-compose.yml and nginx.conf")
@@ -206,7 +468,6 @@ def command_validate(_args=None):
     failed = False
     manifest = None
 
-    # Check 1: Manifest existence
     if MANIFEST.exists():
         try:
             manifest = load_manifest()
@@ -218,7 +479,6 @@ def command_validate(_args=None):
         failed = True
         print_check("manifest.yaml exists and is valid YAML", False, "file not found")
 
-    # Check 2: Mandatory fields
     if manifest is not None:
         try:
             require_fields(manifest)
@@ -230,7 +490,6 @@ def command_validate(_args=None):
         failed = True
         print_check("all required fields are present and non-empty", False, "manifest could not be loaded")
 
-    # Check 3-5: Environment state
     if manifest is not None:
         image = manifest["services"].get("image")
         ok = image_exists(image)
@@ -259,6 +518,23 @@ def fetch_json(url, timeout=3):
         return json.loads(response.read().decode("utf-8"))
 
 
+def wait_for_opa(timeout=20):
+    manifest = load_manifest()
+    opa_url = manifest.get("policy", {}).get("opa_url", "http://127.0.0.1:8181").rstrip("/")
+    deadline = time.time() + timeout
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{opa_url}/health?plugins", timeout=2) as response:
+                if response.status < 500:
+                    return True
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    print(f"OPA UNAVAILABLE: policy API did not become ready within {timeout}s ({last_error})")
+    return False
+
+
 def wait_for_health(port, expected_mode=None, timeout=60):
     """Blocks until the /healthz endpoint returns 'ok' and matches the expected mode."""
     deadline = time.time() + timeout
@@ -270,7 +546,7 @@ def wait_for_health(port, expected_mode=None, timeout=60):
             if data.get("status") == "ok" and (expected_mode is None or data.get("mode") == expected_mode):
                 return data
             last_error = f"unexpected response: {data}"
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except Exception as exc:
             last_error = str(exc)
         time.sleep(2)
     raise TimeoutError(f"health check failed after {timeout}s: {last_error}")
@@ -279,9 +555,21 @@ def wait_for_health(port, expected_mode=None, timeout=60):
 def command_deploy(_args=None):
     """Generates configs, starts Docker containers, and waits for health checks."""
     command_init()
+    run(["docker", "compose", "up", "-d", "opa"])
+    if not wait_for_opa():
+        log_event("deploy", detail="blocked because OPA was unavailable", success=False)
+        print("FAIL: Deployment aborted because policy enforcement is unavailable.")
+        sys.exit(1)
+
+    if not check_predeploy():
+        log_event("deploy", detail="blocked by infra policy", success=False)
+        print("FAIL: Deployment aborted due to policy violations.")
+        sys.exit(1)
+
     run(["docker", "compose", "up", "-d", "--force-recreate"])
     manifest = load_manifest()
     data = wait_for_health(manifest["nginx"]["port"], manifest["services"].get("mode", "stable"), 60)
+    log_event("deploy", detail=f"mode={data.get('mode')} version={manifest['services'].get('version', 'v1')}")
     print(f"DEPLOY SUCCESS: /healthz status={data.get('status')} mode={data.get('mode')} uptime={data.get('uptime')}")
 
 
@@ -293,12 +581,19 @@ def command_promote(args):
 
     manifest = load_manifest()
     require_fields(manifest)
+
+    if not check_prepromote(manifest):
+        log_event("promote", detail=f"to {args.mode} — blocked by canary policy", success=False)
+        print("FAIL: Promotion aborted due to policy failure (Canary unhealthy).")
+        sys.exit(1)
+
+    old_mode = manifest["services"].get("mode", "stable")
     manifest.setdefault("services", {})["mode"] = args.mode
     save_manifest(manifest)
     command_init()
-    # Recreate only the application container with no downtime to Nginx
     run(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "app"])
     data = wait_for_health(manifest["nginx"]["port"], args.mode, 60)
+    log_event("promote", detail=f"{old_mode} -> {args.mode}")
     print(f"PROMOTE SUCCESS: active mode is {data.get('mode')}")
 
 
@@ -306,14 +601,285 @@ def command_teardown(args):
     """Stops and removes the entire Docker stack."""
     run(["docker", "compose", "down", "-v", "--remove-orphans"], check=False)
     if args.clean:
-        # Optionally remove the generated files as well
         for path in (COMPOSE_FILE, NGINX_CONF):
             if path.exists():
                 path.unlink()
+        log_event("teardown", detail="with --clean")
         print("STACK REMOVED: generated configs deleted")
     else:
+        log_event("teardown")
         print("STACK REMOVED")
 
+
+# --- Status Dashboard ---
+
+def command_status(_args=None):
+    """Displays a live dashboard of container health, mode, and resource usage."""
+    print("=" * 60)
+    print("  SWIFTDEPLOY STATUS DASHBOARD")
+    print("=" * 60)
+
+    # 1. Container status
+    print("\n--- Containers ---")
+    result = run(
+        ["docker", "compose", "ps", "--format", "json"],
+        check=False, capture=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        print("  No containers running (stack is down)")
+        print("=" * 60)
+        return
+
+    containers = []
+    for line in result.stdout.strip().splitlines():
+        try:
+            containers.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    for c in containers:
+        name = c.get("Name", c.get("Service", "?"))
+        state = c.get("State", "unknown")
+        health = c.get("Health", "n/a")
+        status_line = c.get("Status", "")
+        icon = "✓" if state == "running" else "✗"
+        print(f"  {icon} {name:<20} state={state:<10} health={health:<12} {status_line}")
+
+    # 2. App health via /healthz
+    print("\n--- Application Health ---")
+    try:
+        manifest = load_manifest()
+        port = manifest["nginx"]["port"]
+        data = fetch_json(f"http://127.0.0.1:{port}/healthz", timeout=3)
+        print(f"  Status : {data.get('status', '?')}")
+        print(f"  Mode   : {data.get('mode', '?')}")
+        print(f"  Uptime : {data.get('uptime', '?')}s")
+    except Exception:
+        print("  Could not reach /healthz (app may be starting)")
+
+    # 3. Docker resource usage
+    print("\n--- Resource Usage ---")
+    stats = run(
+        ["docker", "stats", "--no-stream", "--format",
+         "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
+        check=False, capture=True,
+    )
+    if stats.returncode == 0 and stats.stdout.strip():
+        for line in stats.stdout.strip().splitlines():
+            print(f"  {line}")
+    else:
+        print("  Unable to retrieve resource stats")
+
+    # 4. Last 3 history events
+    print("\n--- Recent Activity ---")
+    if HISTORY_FILE.exists():
+        lines = HISTORY_FILE.read_text(encoding="utf-8").strip().splitlines()
+        recent = lines[-5:] if len(lines) >= 5 else lines
+        for raw in recent:
+            try:
+                evt = json.loads(raw)
+                ts = evt["timestamp"][:19].replace("T", " ")
+                ok = "✓" if evt.get("success", True) else "✗"
+                detail = evt.get("detail", "")
+                print(f"  {ok} [{ts}] {evt['action']}  {detail}")
+            except (json.JSONDecodeError, KeyError):
+                continue
+    else:
+        print("  No history yet")
+
+    print("=" * 60)
+
+
+# --- Audit Report ---
+
+def command_audit(_args=None):
+    """Generates a summary report from the history.jsonl event log."""
+    if not HISTORY_FILE.exists():
+        print("No history.jsonl found. Deploy at least once to start logging.")
+        return
+
+    lines = HISTORY_FILE.read_text(encoding="utf-8").strip().splitlines()
+    events = []
+    for raw in lines:
+        try:
+            events.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+
+    if not events:
+        print("History file is empty.")
+        return
+
+    # Count actions
+    counts = {}
+    failures = 0
+    for evt in events:
+        action = evt.get("action", "unknown")
+        counts[action] = counts.get(action, 0) + 1
+        if not evt.get("success", True):
+            failures += 1
+
+    first_ts = events[0].get("timestamp", "?")[:19].replace("T", " ")
+    last_ts = events[-1].get("timestamp", "?")[:19].replace("T", " ")
+
+    print("=" * 60)
+    print("  SWIFTDEPLOY AUDIT REPORT")
+    print("=" * 60)
+    print(f"\n  Period     : {first_ts}  →  {last_ts}")
+    print(f"  Total Events: {len(events)}")
+    print(f"  Failures   : {failures}")
+
+    print("\n  --- Action Breakdown ---")
+    for action, count in sorted(counts.items()):
+        print(f"    {action:<15} {count}")
+
+    print("\n  --- Full Timeline ---")
+    for evt in events:
+        ts = evt.get("timestamp", "?")[:19].replace("T", " ")
+        ok = "✓" if evt.get("success", True) else "✗"
+        detail = evt.get("detail", "")
+        print(f"    {ok} [{ts}] {evt.get('action', '?'):<12} {detail}")
+
+    print("\n" + "=" * 60)
+
+
+# --- Stage 4B Status/Audit Overrides ---
+
+def render_status_once(previous=None):
+    manifest = load_manifest()
+    snapshot = scrape_metrics_snapshot(manifest)
+    compliance = evaluate_policy_compliance(manifest, snapshot)
+    now = time.time()
+
+    req_per_second = 0.0
+    if previous:
+        elapsed = max(now - previous["time"], 0.001)
+        req_delta = max(snapshot["total_requests"] - previous["snapshot"]["total_requests"], 0)
+        req_per_second = req_delta / elapsed
+
+    append_history({
+        "action": "metrics_scrape",
+        "success": all(item["decision"].get("allow", False) for item in compliance.values()),
+        "metrics": {
+            "req_per_second": req_per_second,
+            "p99_latency_seconds": snapshot["p99_latency_seconds"],
+            "error_rate": snapshot["error_rate"],
+            "mode": snapshot["mode"],
+            "chaos_active": snapshot["chaos_active"],
+        },
+        "policy": compliance,
+    })
+
+    print("=" * 72)
+    print("SWIFTDEPLOY STATUS")
+    print("=" * 72)
+    print(f"Time          : {snapshot['timestamp']}")
+    print(f"Mode          : {'canary' if snapshot['mode'] == 1 else 'stable'}")
+    print(f"Uptime        : {int(snapshot['uptime'] or 0)}s")
+    print(f"Chaos         : {int(snapshot['chaos_active'] or 0)} (0=none, 1=slow, 2=error)")
+    print(f"Throughput    : {req_per_second:.2f} req/s")
+    print(f"Error rate    : {snapshot['error_rate']:.2%}")
+    print(f"P99 latency   : {snapshot['p99_latency_seconds']:.3f}s")
+    print("\nPolicy Compliance")
+    for domain, item in compliance.items():
+        decision = item["decision"]
+        status = "PASS" if decision.get("allow", False) else "FAIL"
+        reasons = decision.get("reasons") or ["policy allowed"]
+        print(f"- {domain}: {status} - {'; '.join(str(reason) for reason in reasons)}")
+    print("=" * 72)
+    return {"time": now, "snapshot": snapshot}
+
+
+def command_status(args):
+    previous = None
+    refreshes = args.count
+    while refreshes is None or refreshes > 0:
+        try:
+            os.system("cls" if os.name == "nt" else "clear")
+            previous = render_status_once(previous)
+        except Exception as exc:
+            append_history({"action": "metrics_scrape", "success": False, "detail": f"status failed: {exc}"})
+            print(f"STATUS UNAVAILABLE: {exc}")
+        if refreshes is not None:
+            refreshes -= 1
+            if refreshes <= 0:
+                break
+        time.sleep(args.interval)
+
+
+def command_audit(_args=None):
+    if not HISTORY_FILE.exists():
+        print("No history.jsonl found. Deploy or run status first to start logging.")
+        return
+
+    events = []
+    for raw in HISTORY_FILE.read_text(encoding="utf-8").strip().splitlines():
+        try:
+            events.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    if not events:
+        print("History file is empty.")
+        return
+
+    counts = {}
+    violations = []
+    timeline = []
+    for evt in events:
+        action = evt.get("action", "unknown")
+        counts[action] = counts.get(action, 0) + 1
+        if not evt.get("success", True):
+            violations.append(evt)
+        if action in {"deploy", "promote", "chaos", "policy_check", "metrics_scrape"}:
+            timeline.append(evt)
+
+    first_ts = events[0].get("timestamp", "?")[:19].replace("T", " ")
+    last_ts = events[-1].get("timestamp", "?")[:19].replace("T", " ")
+    report = [
+        "# SwiftDeploy Audit Report",
+        "",
+        f"**Period:** {first_ts} -> {last_ts}",
+        f"**Total events:** {len(events)}",
+        f"**Policy violations / failures:** {len(violations)}",
+        "",
+        "## Action Breakdown",
+        "",
+        "| Action | Count |",
+        "| --- | ---: |",
+    ]
+    for action, count in sorted(counts.items()):
+        report.append(f"| {action} | {count} |")
+
+    report.extend(["", "## Timeline", "", "| Time UTC | Action | Success | Summary |", "| --- | --- | --- | --- |"])
+    for evt in timeline:
+        ts = evt.get("timestamp", "?")[:19].replace("T", " ")
+        ok = "yes" if evt.get("success", True) else "no"
+        detail = evt.get("detail", "")
+        if isinstance(detail, list):
+            detail = "; ".join(str(item) for item in detail)
+        if evt.get("action") == "metrics_scrape":
+            metrics = evt.get("metrics", {})
+            detail = f"mode={metrics.get('mode')} p99={metrics.get('p99_latency_seconds')} error_rate={metrics.get('error_rate')}"
+        report.append(f"| {ts} | {evt.get('action', '?')} | {ok} | {str(detail).replace('|', '/')} |")
+
+    report.extend(["", "## Violations", ""])
+    if violations:
+        report.extend(["| Time UTC | Action | Reason |", "| --- | --- | --- |"])
+        for evt in violations:
+            ts = evt.get("timestamp", "?")[:19].replace("T", " ")
+            detail = evt.get("detail", "")
+            if isinstance(detail, list):
+                detail = "; ".join(str(item) for item in detail)
+            report.append(f"| {ts} | {evt.get('action', '?')} | {str(detail).replace('|', '/')} |")
+    else:
+        report.append("No policy violations were recorded.")
+    report.append("")
+
+    AUDIT_REPORT.write_text("\n".join(report), encoding="utf-8")
+    print(f"PASS: generated {AUDIT_REPORT.name}")
+
+
+# --- CLI Parser ---
 
 def build_parser():
     """Defines the CLI argument structure."""
@@ -323,6 +889,11 @@ def build_parser():
     subcommands.add_parser("init").set_defaults(func=command_init)
     subcommands.add_parser("validate").set_defaults(func=command_validate)
     subcommands.add_parser("deploy").set_defaults(func=command_deploy)
+    status = subcommands.add_parser("status")
+    status.add_argument("--interval", type=float, default=2.0)
+    status.add_argument("--count", type=int, default=None)
+    status.set_defaults(func=command_status)
+    subcommands.add_parser("audit").set_defaults(func=command_audit)
 
     promote = subcommands.add_parser("promote")
     promote.add_argument("mode", choices=["stable", "canary"])

@@ -3,6 +3,7 @@ import time
 import random
 import asyncio
 from datetime import datetime, timezone
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
@@ -32,9 +33,35 @@ class ChaosRequest(BaseModel):
     duration: int | None = None
     rate: float | None = None
 
+# --- Prometheus Metrics Definitions ---
 
-# Middleware: A function that runs on every request
-# This one adds a custom header to identify 'canary' traffic
+# Request counter: tracks total requests by method, path, and status code
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status_code"]
+)
+
+# Request latency: tracks how long requests take to complete
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency in seconds",
+    buckets=[0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
+)
+
+# App uptime: tracks how long the app has been running
+APP_UPTIME = Gauge("app_uptime_seconds", "Application uptime in seconds")
+
+# App mode: 0 for stable, 1 for canary
+APP_MODE = Gauge("app_mode", "Application mode (0=stable, 1=canary)")
+
+# Chaos active: 0=none, 1=slow, 2=error
+CHAOS_ACTIVE = Gauge("chaos_active", "Current chaos mode active (0=none, 1=slow, 2=error)")
+
+
+# --- Middleware ---
+
+# Middleware to add headers in canary mode
 @app.middleware("http")
 async def add_mode_header(request: Request, call_next):
     response = await call_next(request)
@@ -42,8 +69,43 @@ async def add_mode_header(request: Request, call_next):
         response.headers["X-Mode"] = "canary"
     return response
 
+# Middleware to record Prometheus metrics for every request
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
 
-# Root endpoint: Basic info about the app
+    # Record request count and latency
+    REQUEST_COUNT.labels(
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code
+    ).inc()
+    REQUEST_LATENCY.observe(duration)
+
+    return response
+
+
+# --- Utility Functions ---
+
+def update_state_metrics():
+    """Refreshes Gauge metrics before they are served to Prometheus."""
+    # Update Uptime
+    APP_UPTIME.set(time.time() - start_time)
+    
+    # Update App Mode
+    APP_MODE.set(1 if MODE == "canary" else 0)
+    
+    # Update Chaos State
+    chaos_map = {None: 0, "slow": 1, "error": 2}
+    current_mode = chaos_state.get("mode")
+    CHAOS_ACTIVE.set(chaos_map.get(current_mode, 0))
+
+
+# --- Endpoints ---
+
+# Root endpoint
 @app.get("/")
 def root():
     return {
@@ -54,7 +116,7 @@ def root():
     }
 
 
-# Health Check: Used by Docker and Load Balancers to verify the app is alive
+# Health Check
 @app.get("/healthz")
 def health():
     uptime = int(time.time() - start_time)
@@ -65,8 +127,17 @@ def health():
     }
 
 
-# Chaos Endpoint: Control the app's behavior (Only works in Canary mode)
-# This allows testing how your system handles slow or failing services
+# Metrics Endpoint: Exposes metrics for Prometheus scraping
+@app.get("/metrics")
+def metrics():
+    update_state_metrics()
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
+
+# Chaos Endpoint (only works in canary mode)
 @app.post("/chaos")
 def chaos(req: ChaosRequest):
     global chaos_state
@@ -87,7 +158,6 @@ def chaos(req: ChaosRequest):
         chaos_state["error_rate"] = req.rate
 
     elif req.mode == "recover":
-        # Reset to normal behavior
         chaos_state = {"mode": None, "duration": 0, "error_rate": 0}
     else:
         raise HTTPException(status_code=400, detail="mode must be slow, error, or recover")
@@ -95,20 +165,19 @@ def chaos(req: ChaosRequest):
     return {"status": "chaos updated", "state": chaos_state}
 
 
-# Chaos Middleware: Actually applies the slow/error logic to incoming requests
+# Chaos Middleware: Applies slow/error logic to requests
 @app.middleware("http")
 async def chaos_middleware(request: Request, call_next):
     global chaos_state
 
-    # Skip chaos for health checks and the chaos control endpoint itself
-    if MODE != "canary" or request.url.path in {"/healthz", "/chaos"}:
+    if MODE != "canary" or request.url.path in {"/healthz", "/chaos", "/metrics"}:
         return await call_next(request)
 
-    # Slow mode: Inject latency
+    # Slow mode
     if chaos_state["mode"] == "slow":
         await asyncio.sleep(chaos_state["duration"])
 
-    # Error mode: Randomly return 500 errors based on the configured rate
+    # Error mode
     if chaos_state["mode"] == "error":
         if random.random() < chaos_state["error_rate"]:
             return Response(

@@ -43,6 +43,18 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: swift_opa
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+    volumes:
+      - ./policies:/policies
+    ports:
+      - "127.0.0.1:8181:8181"
+    networks:
+      - {{NETWORK}}
+    restart: {{RESTART_POLICY}}
+
 networks:
   {{NETWORK}}:
     driver: {{DRIVER}}

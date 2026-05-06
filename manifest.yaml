@@ -14,3 +14,11 @@ nginx:
 network:
   name: swiftdeploy-net
   driver_type: bridge
+
+policy:
+  opa_url: http://127.0.0.1:8181
+  infra_min_disk_gb: 10
+  infra_max_cpu_load: 2.0
+  canary_max_error_rate: 0.01
+  canary_max_p99_latency_seconds: 0.5
+  canary_window_seconds: 30

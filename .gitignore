@@ -1,6 +1,8 @@
-# Generated config files
+# Generated / runtime files
 docker-compose.yml
 nginx.conf
+history.jsonl
+audit_report.md
 
 # Python
 __pycache__/
